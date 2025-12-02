@@ -43,8 +43,14 @@ function Chat() {
     if (!text || !apiKey) return;
     setBusy(true);
     setInput('');
-    const nextMessages = [...messages, { role: 'user', content: text } as ChatMessage];
-    setMessages(nextMessages);
+
+    // 1) Append user message
+    const withUser = [...messages, { role: 'user', content: text } as ChatMessage];
+    setMessages(withUser);
+
+    // 2) Prepare empty assistant message for streaming
+    const assistantIndex = withUser.length; // next index
+    setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
 
     try {
       const resp = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -55,8 +61,9 @@ function Chat() {
         },
         body: JSON.stringify({
           model: 'gpt-4o-mini',
-          messages: nextMessages.map(m => ({ role: m.role, content: m.content })),
+          messages: withUser.map(m => ({ role: m.role, content: m.content })),
           temperature: 0.7,
+          stream: true,
         }),
       });
 
@@ -64,14 +71,66 @@ function Chat() {
         const errText = await resp.text();
         throw new Error(`HTTP ${resp.status}: ${errText}`);
       }
-      const data = await resp.json();
-      const assistantText: string = data.choices?.[0]?.message?.content ?? '(no content)';
-      setMessages(prev => [...prev, { role: 'assistant', content: assistantText }]);
+
+      // Streaming via SSE-like chunks
+      const reader = resp.body?.getReader();
+      if (!reader) {
+        // Fallback: try to parse as JSON once (shouldn't happen with stream: true)
+        const data = await resp.json();
+        const assistantText: string = data.choices?.[0]?.message?.content ?? '(no content)';
+        setMessages(prev => prev.map((m, i) => i === assistantIndex ? { ...m, content: assistantText } : m));
+        return;
+      }
+
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let done = false;
+      while (!done) {
+        const { value, done: rdDone } = await reader.read();
+        done = rdDone;
+        if (value) buffer += decoder.decode(value, { stream: true });
+
+        // Process complete lines
+        let lineBreakIdx: number;
+        while ((lineBreakIdx = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, lineBreakIdx).trim();
+          buffer = buffer.slice(lineBreakIdx + 1);
+          if (!line) continue;
+
+          // SSE format lines start with "data:"
+          if (line.startsWith('data:')) {
+            const jsonStr = line.replace(/^data:\s*/, '');
+            if (jsonStr === '[DONE]') {
+              done = true; // graceful end
+              break;
+            }
+            try {
+              const parsed = JSON.parse(jsonStr);
+              const delta: string | undefined = parsed?.choices?.[0]?.delta?.content;
+              if (typeof delta === 'string' && delta.length > 0) {
+                setMessages(prev => {
+                  const next = [...prev];
+                  const msg = next[assistantIndex];
+                  if (msg && msg.role === 'assistant') {
+                    next[assistantIndex] = { ...msg, content: (msg.content || '') + delta };
+                  }
+                  return next;
+                });
+                // Keep autoscrolling on new chunks
+                listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
+              }
+            } catch (err) {
+              // Non-JSON heartbeat or error line; skip
+            }
+          }
+        }
+      }
     } catch (e: any) {
-      setMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: `Ошибка запроса: ${e?.message || String(e)}` },
-      ]);
+      setMessages(prev => prev.map((m, i) => (
+        i === assistantIndex
+          ? { ...m, content: `Ошибка запроса: ${e?.message || String(e)}` }
+          : m
+      )));
     } finally {
       setBusy(false);
     }
